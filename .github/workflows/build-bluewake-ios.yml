@@ -1,0 +1,171 @@
+name: Build BlueWake iOS IPA
+run-name: BlueWake app-only IPA · T-Build · ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+  # This also works when workflow_dispatch is unavailable on the default branch.
+  # Edit this file on T-Build (even a comment) to request another build.
+  push:
+    branches: [T-Build]
+    paths: [.github/workflows/build-bluewake-ios.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bluewake-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'NevrrL8/bluewake-TiPad' && github.ref == 'refs/heads/T-Build'
+    runs-on: macos-15-arm64
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+      IPA: ${{ github.workspace }}/build/artifacts/BlueWake-T-Build-ios-arm64-app-only-unsigned.ipa
+
+    steps:
+      - name: Check out the exact T-Build event commit
+        uses: actions/checkout@v4
+        with:
+          repository: NevrrL8/bluewake-TiPad
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python for BlueWake and build tools
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Verify source and Apple toolchain
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/T-Build
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(uname -m)" = arm64
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --find clang
+          # CMake 3.x avoids CMake 4 policy removals in pinned dependencies.
+          python -m pip install --disable-pip-version-check cmake==3.31.6 ninja==1.11.1.4
+          cmake --version
+          ninja --version
+          bash scripts/audit_repo.sh
+
+      - name: Build the unsigned app-only iOS IPA with BlueWake's builder
+        run: |
+          set -euo pipefail
+          # Fetches the profile's pinned RecompCore, DolRecomp and checksummed
+          # Dawn package; Aurora supplies its pinned SDL3 and other libraries.
+          # No disc input, signing identity or provisioning profile is supplied.
+          bash scripts/builder/build.sh --app-only --platform ios \
+            --out build/ios-app-only --jobs 3 --ipa "$IPA"
+          test -s "$IPA"
+
+      - name: Verify the packaged iPad app, executable and game-data boundary
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import plistlib
+          import re
+          import stat
+          import subprocess
+          import tempfile
+          import zipfile
+
+          ipa = Path(os.environ['IPA'])
+          if not ipa.is_file() or ipa.stat().st_size == 0:
+              raise SystemExit('IPA missing or empty')
+          forbidden = {'.iso', '.gcm', '.rvz', '.wbfs', '.wia', '.ciso', '.gcz',
+                       '.nfs', '.dol', '.rel', '.card', '.gci', '.sav', '.raw',
+                       '.p12', '.pfx', '.mobileprovision', '.provisionprofile'}
+          with zipfile.ZipFile(ipa) as archive:
+              if archive.testzip() is not None:
+                  raise SystemExit('Corrupt IPA')
+              names = archive.namelist()
+              if len(names) != len(set(names)):
+                  raise SystemExit('Duplicate IPA members')
+              apps = set()
+              for entry in archive.infolist():
+                  p = PurePosixPath(entry.filename)
+                  if p.is_absolute() or '..' in p.parts or '\\' in entry.filename:
+                      raise SystemExit('Unsafe IPA path')
+                  if len(p.parts) < 2 or p.parts[0] != 'Payload' or not p.parts[1].endswith('.app'):
+                      if entry.filename == 'Payload/':
+                          continue
+                      raise SystemExit(f'Unexpected IPA member: {p}')
+                  apps.add(p.parts[1])
+                  lower = entry.filename.lower()
+                  if (p.suffix.lower() in forbidden or 'ggzle01_recomp' in lower
+                          or '_codesignature' in lower or p.name.lower() in
+                          {'keys.txt', 'dsp_rom.bin', 'dsp_coef.bin'}):
+                      raise SystemExit(f'Private/game/signing content in IPA: {p}')
+              if len(apps) != 1:
+                  raise SystemExit('Expected exactly one app bundle')
+              bundle = 'Payload/' + apps.pop()
+              info = plistlib.loads(archive.read(bundle + '/Info.plist'))
+              executable = info.get('CFBundleExecutable', '')
+              if not executable or '/' in executable or executable in {'.', '..'}:
+                  raise SystemExit('Invalid CFBundleExecutable')
+              if (info.get('CFBundlePackageType') != 'APPL'
+                      or info.get('CFBundleIdentifier') != 'dev.bluewake.BlueWake'
+                      or 2 not in info.get('UIDeviceFamily', [])):
+                  raise SystemExit('Not the expected iPad app')
+              member = archive.getinfo(bundle + '/' + executable)
+              if member.file_size == 0 or not (member.external_attr >> 16) & stat.S_IXUSR:
+                  raise SystemExit('Missing or non-executable app binary')
+              provenance = json.loads(archive.read(bundle + '/BuilderProvenance.json'))
+              if (provenance.get('containsTranslatedGameCode') is not False
+                      or provenance.get('source_commit') != os.environ['GITHUB_SHA']):
+                  raise SystemExit('App-only provenance/source validation failed')
+
+          with tempfile.TemporaryDirectory() as temp:
+              subprocess.run(['ditto', '-x', '-k', str(ipa), temp], check=True)
+              binary = Path(temp) / bundle / executable
+              description = subprocess.check_output(['file', '-b', str(binary)], text=True)
+              print(description)
+              if 'Mach-O' not in description or 'executable' not in description:
+                  raise SystemExit('App binary is not a Mach-O executable')
+              archs = subprocess.check_output(['xcrun', 'lipo', '-archs', str(binary)], text=True).split()
+              if archs != ['arm64']:
+                  raise SystemExit(f'Expected ARM64 device executable, got {archs}')
+              commands = subprocess.check_output(['xcrun', 'otool', '-l', str(binary)], text=True)
+              if not (re.search(r'\bplatform\s+(?:2|IOS)\b', commands)
+                      or 'LC_VERSION_MIN_IPHONEOS' in commands):
+                  raise SystemExit('Executable is not built for iOS devices')
+              signature = subprocess.run(['codesign', '-d', str(binary)], capture_output=True, text=True)
+              if signature.returncode == 0 or 'not signed at all' not in signature.stderr:
+                  raise SystemExit('Expected an unsigned executable')
+          print('Verified: unsigned ARM64 iPad app-only IPA from T-Build; no game module.')
+          PY
+          shasum -a 256 "$IPA" > "$IPA.sha256"
+
+      - name: Upload the verified unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlueWake-T-Build-ios-arm64-app-only-unsigned-${{ github.run_number }}
+          path: |
+            ${{ env.IPA }}
+            ${{ env.IPA }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Explain the downloadable artifact
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          Built and verified an **unsigned ARM64 iOS app-only IPA** from T-Build commit $GITHUB_SHA.
+
+          Download the artifact below, unzip it in Files, and sign the IPA with SideStore.
+          **This shell is not playable:** it contains no Wind Waker game module or disc assets.
+          Create a complete personal build locally on an Apple Silicon Mac using your own supported disc.
+          Do not upload personal builds or game data to Actions, releases or the repository.
+          EOF
